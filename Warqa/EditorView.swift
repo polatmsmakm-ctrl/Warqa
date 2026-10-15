@@ -7,80 +7,74 @@ import UIKit
 struct EditorView: View {
     @Binding var project: Project
 
-    @State private var pageIndex = 0
+    @State private var activePageID: UUID? = nil
     @State private var selection: UUID? = nil
+    @State private var zoom: Double = 1
+    @State private var pinchBase: Double = 1
+    @State private var pinching = false
     @State private var showTextEditor = false
     @State private var showRename = false
     @State private var photoItem: PhotosPickerItem? = nil
     @State private var shareURLs: [URL] = []
     @State private var showShare = false
+    @State private var scrollTarget: UUID? = nil
 
-    private var safeIndex: Int {
-        min(max(pageIndex, 0), max(project.pages.count - 1, 0))
+    // undo / redo
+    @State private var undoStack: [[Page]] = []
+    @State private var redoStack: [[Page]] = []
+    @State private var baseline: [Page] = []
+    @State private var restoring = false
+    @State private var commitTask: Task<Void, Never>? = nil
+
+    // MARK: lookups
+
+    private var activeIndex: Int {
+        if let id = activePageID, let i = project.pages.firstIndex(where: { $0.id == id }) {
+            return i
+        }
+        return 0
     }
 
-    private var pageBinding: Binding<Page> {
+    private var activePageBinding: Binding<Page> {
         Binding(
-            get: { project.pages[safeIndex] },
-            set: { project.pages[safeIndex] = $0 }
+            get: { project.pages[activeIndex] },
+            set: { project.pages[activeIndex] = $0 }
         )
     }
 
+    private func locate(_ id: UUID) -> (Int, Int)? {
+        for (pi, page) in project.pages.enumerated() {
+            if let ei = page.elements.firstIndex(where: { $0.id == id }) {
+                return (pi, ei)
+            }
+        }
+        return nil
+    }
+
     private func elementBinding(_ id: UUID) -> Binding<Element>? {
-        guard let current = project.pages[safeIndex].elements.first(where: { $0.id == id }) else { return nil }
+        guard let loc = locate(id) else { return nil }
+        let current = project.pages[loc.0].elements[loc.1]
         return Binding(
-            get: { project.pages[safeIndex].elements.first(where: { $0.id == id }) ?? current },
+            get: {
+                if let l = locate(id) { return project.pages[l.0].elements[l.1] }
+                return current
+            },
             set: { newValue in
-                if let i = project.pages[safeIndex].elements.firstIndex(where: { $0.id == id }) {
-                    project.pages[safeIndex].elements[i] = newValue
-                }
+                if let l = locate(id) { project.pages[l.0].elements[l.1] = newValue }
             }
         )
     }
 
     private var inkColor: RGBA {
-        project.pages[safeIndex].background.luminance > 0.5 ? RGBA.ink : RGBA.white
+        project.pages[activeIndex].background.luminance > 0.5 ? RGBA.ink : RGBA.white
     }
+
+    // MARK: body
 
     var body: some View {
         VStack(spacing: 0) {
-            GeometryReader { geo in
-                let s = max(0.1, min((geo.size.width - 24) / PageSize.w, (geo.size.height - 24) / PageSize.h))
-                ZStack {
-                    Color(.systemGray5)
-                    EditorCanvas(
-                        page: pageBinding,
-                        selection: $selection,
-                        onEditText: { showTextEditor = true },
-                        onDelete: { id in deleteElement(id) }
-                    )
-                    .environment(\.canvasScale, s)
-                    .environment(\.layoutDirection, .leftToRight)
-                    .shadow(color: .black.opacity(0.25), radius: 6)
-                    .scaleEffect(s, anchor: .center)
-                    .frame(width: PageSize.w * s, height: PageSize.h * s)
-                }
-                .frame(width: geo.size.width, height: geo.size.height)
-            }
-
-            VStack(spacing: 8) {
-                if let id = selection, let binding = elementBinding(id) {
-                    InspectorView(
-                        el: binding,
-                        onEditText: { showTextEditor = true },
-                        onDuplicate: { duplicateSelected() },
-                        onFront: { moveSelected(toFront: true) },
-                        onBack: { moveSelected(toFront: false) },
-                        onDelete: { deleteElement(id) }
-                    )
-                } else {
-                    PageInspector(page: pageBinding)
-                }
-                addBar
-                pagesBar
-            }
-            .padding(.vertical, 8)
-            .background(Color(.systemBackground))
+            canvasArea
+            bottomPanel
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -90,13 +84,17 @@ struct EditorView: View {
                 }
                 .buttonStyle(.plain)
             }
-            ToolbarItem(placement: .navigationBarTrailing) {
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                Button { undo() } label: { Image(systemName: "arrow.uturn.backward") }
+                    .disabled(undoStack.isEmpty && baseline == project.pages)
+                Button { redo() } label: { Image(systemName: "arrow.uturn.forward") }
+                    .disabled(redoStack.isEmpty)
                 Menu {
                     Button { sharePDF() } label: {
                         Label("مشاركة كل الصفحات PDF", systemImage: "doc.richtext")
                     }
                     Button { sharePNG() } label: {
-                        Label("مشاركة هذه الصفحة صورة", systemImage: "photo")
+                        Label("مشاركة الصفحة الحالية صورة", systemImage: "photo")
                     }
                 } label: {
                     Image(systemName: "square.and.arrow.up")
@@ -118,6 +116,10 @@ struct EditorView: View {
         .sheet(isPresented: $showShare) {
             ShareSheet(items: shareURLs)
         }
+        .onAppear {
+            baseline = project.pages
+            if activePageID == nil { activePageID = project.pages.first?.id }
+        }
         .onChange(of: photoItem) { item in
             guard let item = item else { return }
             Task {
@@ -128,12 +130,151 @@ struct EditorView: View {
                 await MainActor.run { photoItem = nil }
             }
         }
-        .onChange(of: project.pages) { _ in
+        .onChange(of: project.pages) { newPages in
             project.updated = Date()
+            if restoring {
+                restoring = false
+                baseline = newPages
+                return
+            }
+            commitTask?.cancel()
+            commitTask = Task {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                if Task.isCancelled { return }
+                await MainActor.run { commitHistory() }
+            }
         }
     }
 
-    // MARK: bars
+    // MARK: canvas (pages stacked vertically, like Canva)
+
+    private var canvasArea: some View {
+        GeometryReader { geo in
+            let fit = max(0.1, (geo.size.width - 32) / PageSize.w)
+            let s = fit * CGFloat(zoom)
+            ScrollViewReader { proxy in
+                ScrollView([.vertical, .horizontal], showsIndicators: false) {
+                    VStack(spacing: 22) {
+                        ForEach($project.pages) { $page in
+                            pageBlock($page, scale: s)
+                                .id(page.id)
+                        }
+                        addPageButton(width: PageSize.w * s)
+                    }
+                    .padding(.vertical, 16)
+                    .frame(minWidth: geo.size.width)
+                }
+                .background(Color(.systemGray5))
+                .onChange(of: scrollTarget) { id in
+                    if let id = id {
+                        withAnimation { proxy.scrollTo(id, anchor: .top) }
+                    }
+                }
+                .simultaneousGesture(
+                    MagnificationGesture()
+                        .onChanged { value in
+                            if !pinching {
+                                pinching = true
+                                pinchBase = zoom
+                            }
+                            zoom = min(3, max(0.4, pinchBase * Double(value)))
+                        }
+                        .onEnded { _ in pinching = false }
+                )
+            }
+        }
+    }
+
+    private func pageBlock(_ page: Binding<Page>, scale s: CGFloat) -> some View {
+        let pageID = page.wrappedValue.id
+        let index = project.pages.firstIndex(where: { $0.id == pageID }) ?? 0
+        return VStack(spacing: 8) {
+            pageHeader(index: index, id: pageID)
+                .frame(width: PageSize.w * s)
+            EditorCanvas(
+                page: page,
+                selection: $selection,
+                onActivate: { activePageID = pageID },
+                onEditText: { showTextEditor = true },
+                onDelete: { id in deleteElement(id) },
+                onDuplicate: { duplicateSelected() }
+            )
+            .environment(\.canvasScale, s)
+            .environment(\.layoutDirection, .leftToRight)
+            .shadow(color: .black.opacity(0.25), radius: 5)
+            .scaleEffect(s, anchor: .center)
+            .frame(width: PageSize.w * s, height: PageSize.h * s)
+        }
+    }
+
+    private func pageHeader(index: Int, id: UUID) -> some View {
+        let isActive = (id == project.pages[activeIndex].id)
+        return HStack(spacing: 16) {
+            Text("صفحة \(index + 1)")
+                .font(.footnote.weight(.semibold))
+                .foregroundColor(isActive ? .accentColor : .secondary)
+            Spacer()
+            Button { movePage(index, by: -1) } label: { Image(systemName: "chevron.up") }
+                .disabled(index == 0)
+            Button { movePage(index, by: 1) } label: { Image(systemName: "chevron.down") }
+                .disabled(index >= project.pages.count - 1)
+            Button { duplicatePage(at: index) } label: { Image(systemName: "plus.square.on.square") }
+            Button(role: .destructive) { deletePage(at: index) } label: { Image(systemName: "trash") }
+                .disabled(project.pages.count <= 1)
+        }
+        .font(.system(size: 15))
+        .buttonStyle(.plain)
+        .foregroundColor(.primary.opacity(0.7))
+    }
+
+    private func addPageButton(width: CGFloat) -> some View {
+        Button { addPage() } label: {
+            Label("إضافة صفحة", systemImage: "plus")
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color(.systemBackground)))
+        }
+        .buttonStyle(.plain)
+        .frame(width: width)
+    }
+
+    // MARK: bottom panel
+
+    private var bottomPanel: some View {
+        VStack(spacing: 8) {
+            if let id = selection, let binding = elementBinding(id) {
+                InspectorView(
+                    el: binding,
+                    onEditText: { showTextEditor = true },
+                    onDuplicate: { duplicateSelected() },
+                    onFront: { moveSelected(toFront: true) },
+                    onBack: { moveSelected(toFront: false) },
+                    onDelete: { deleteElement(id) }
+                )
+            } else {
+                PageInspector(page: activePageBinding)
+            }
+            addBar
+            zoomBar
+        }
+        .padding(.vertical, 8)
+        .background(Color(.systemBackground))
+    }
+
+    private var zoomBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "minus.magnifyingglass").foregroundColor(.secondary)
+            Slider(value: $zoom, in: 0.4...3)
+            Text("\(Int(zoom * 100))%")
+                .font(.caption.monospacedDigit())
+                .frame(width: 44)
+            Text("\(activeIndex + 1)/\(project.pages.count)")
+                .font(.caption.monospacedDigit())
+                .foregroundColor(.secondary)
+        }
+        .padding(.horizontal, 16)
+    }
 
     private func barButton(_ title: String, _ icon: String, action: @escaping () -> Void) -> some View {
         Button(action: action) { barLabel(title, icon) }
@@ -165,56 +306,16 @@ struct EditorView: View {
         }
     }
 
-    private var pagesBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 10) {
-                ForEach(Array(project.pages.enumerated()), id: \.element.id) { index, p in
-                    Button {
-                        pageIndex = index
-                        selection = nil
-                    } label: {
-                        PageThumb(page: p, scale: 0.1)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 3)
-                                    .stroke(index == safeIndex ? Color.accentColor : Color.gray.opacity(0.4),
-                                            lineWidth: index == safeIndex ? 3 : 1)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                        Button { duplicatePage(at: index) } label: {
-                            Label("تكرار الصفحة", systemImage: "plus.square.on.square")
-                        }
-                        if project.pages.count > 1 {
-                            Button(role: .destructive) { deletePage(at: index) } label: {
-                                Label("حذف الصفحة", systemImage: "trash")
-                            }
-                        }
-                    }
-                }
-                Button { addPage() } label: {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 3)
-                            .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
-                        Image(systemName: "plus").foregroundColor(.accentColor)
-                    }
-                    .frame(width: PageSize.w * 0.1, height: PageSize.h * 0.1)
-                }
-            }
-            .padding(.horizontal, 12)
-        }
-    }
-
     // MARK: element actions
 
     private func nextCenter() -> (Double, Double) {
-        let n = project.pages[safeIndex].elements.count % 5
+        let n = project.pages[activeIndex].elements.count % 5
         return (Double(PageSize.w) / 2 + Double(n) * 18,
                 Double(PageSize.h) / 2 - 80 + Double(n) * 18)
     }
 
     private func append(_ element: Element) {
-        project.pages[safeIndex].elements.append(element)
+        project.pages[activeIndex].elements.append(element)
         selection = element.id
     }
 
@@ -252,39 +353,43 @@ struct EditorView: View {
     }
 
     private func deleteElement(_ id: UUID) {
-        project.pages[safeIndex].elements.removeAll { $0.id == id }
+        if let loc = locate(id) {
+            project.pages[loc.0].elements.remove(at: loc.1)
+        }
         if selection == id { selection = nil }
     }
 
     private func duplicateSelected() {
-        guard let id = selection,
-              let i = project.pages[safeIndex].elements.firstIndex(where: { $0.id == id }) else { return }
-        var copy = project.pages[safeIndex].elements[i]
+        guard let id = selection, let loc = locate(id) else { return }
+        var copy = project.pages[loc.0].elements[loc.1]
         copy.id = UUID()
         copy.x += 24
         copy.y += 24
-        append(copy)
+        copy.locked = false
+        project.pages[loc.0].elements.append(copy)
+        selection = copy.id
     }
 
     private func moveSelected(toFront: Bool) {
-        guard let id = selection,
-              let i = project.pages[safeIndex].elements.firstIndex(where: { $0.id == id }) else { return }
-        let element = project.pages[safeIndex].elements.remove(at: i)
+        guard let id = selection, let loc = locate(id) else { return }
+        let element = project.pages[loc.0].elements.remove(at: loc.1)
         if toFront {
-            project.pages[safeIndex].elements.append(element)
+            project.pages[loc.0].elements.append(element)
         } else {
-            project.pages[safeIndex].elements.insert(element, at: 0)
+            project.pages[loc.0].elements.insert(element, at: 0)
         }
     }
 
     // MARK: page actions
 
     private func addPage() {
-        let current = project.pages[safeIndex]
+        let i = activeIndex
+        let current = project.pages[i]
         let page = Page(style: current.style, background: current.background, lineColor: current.lineColor)
-        project.pages.insert(page, at: safeIndex + 1)
-        pageIndex = safeIndex + 1
+        project.pages.insert(page, at: i + 1)
+        activePageID = page.id
         selection = nil
+        scrollTarget = page.id
     }
 
     private func duplicatePage(at index: Int) {
@@ -297,14 +402,51 @@ struct EditorView: View {
             return e
         }
         project.pages.insert(copy, at: index + 1)
-        pageIndex = index + 1
+        activePageID = copy.id
         selection = nil
+        scrollTarget = copy.id
     }
 
     private func deletePage(at index: Int) {
         guard project.pages.count > 1, project.pages.indices.contains(index) else { return }
         project.pages.remove(at: index)
-        pageIndex = max(0, min(index, project.pages.count - 1))
+        activePageID = project.pages[max(0, min(index, project.pages.count - 1))].id
+        selection = nil
+    }
+
+    private func movePage(_ index: Int, by offset: Int) {
+        let target = index + offset
+        guard project.pages.indices.contains(index), project.pages.indices.contains(target) else { return }
+        project.pages.swapAt(index, target)
+        scrollTarget = project.pages[target].id
+    }
+
+    // MARK: undo / redo
+
+    private func commitHistory() {
+        guard baseline != project.pages else { return }
+        undoStack.append(baseline)
+        if undoStack.count > 60 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        baseline = project.pages
+    }
+
+    private func undo() {
+        commitTask?.cancel()
+        commitHistory()
+        guard let previous = undoStack.popLast() else { return }
+        redoStack.append(project.pages)
+        restoring = (previous != project.pages)
+        project.pages = previous
+        selection = nil
+    }
+
+    private func redo() {
+        commitTask?.cancel()
+        guard let next = redoStack.popLast() else { return }
+        undoStack.append(project.pages)
+        restoring = (next != project.pages)
+        project.pages = next
         selection = nil
     }
 
@@ -322,7 +464,7 @@ struct EditorView: View {
     @MainActor
     private func sharePNG() {
         selection = nil
-        if let url = Exporter.png(page: project.pages[safeIndex], name: project.name) {
+        if let url = Exporter.png(page: project.pages[activeIndex], name: project.name) {
             shareURLs = [url]
             showShare = true
         }
@@ -364,6 +506,7 @@ struct InspectorView: View {
                     if supportsFill {
                         toggleChip("تعبئة", "square.fill", $el.filled)
                     }
+                    chip("قلب", "arrow.left.and.right") { el.flipped.toggle() }
                     chip("نسخ", "plus.square.on.square") { onDuplicate() }
                     chip("للأمام", "arrow.up.to.line") { onFront() }
                     chip("للخلف", "arrow.down.to.line") { onBack() }

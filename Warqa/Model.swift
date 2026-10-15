@@ -142,6 +142,13 @@ struct Element: Identifiable, Codable, Equatable {
     var design: TextDesign = .rounded
     var imageFile: String? = nil
     var opacity: Double = 1
+    var flipped: Bool = false
+    var locked: Bool = false
+
+    enum CodingKeys: String, CodingKey {
+        case id, kind, x, y, w, h, rotation, color, filled, dotted, lineWidth
+        case text, fontSize, design, imageFile, opacity, flipped, locked
+    }
 
     var size: CGSize {
         if kind == .text {
@@ -261,5 +268,33 @@ extension UIImage {
         return UIGraphicsImageRenderer(size: newSize, format: format).image { _ in
             self.draw(in: CGRect(origin: .zero, size: newSize))
         }
+    }
+}
+
+
+// Older saved projects don't have every key, so decode with defaults.
+extension Element {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            id: try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID(),
+            kind: try c.decode(ElementKind.self, forKey: .kind),
+            x: try c.decodeIfPresent(Double.self, forKey: .x) ?? 0,
+            y: try c.decodeIfPresent(Double.self, forKey: .y) ?? 0,
+            w: try c.decodeIfPresent(Double.self, forKey: .w) ?? 160,
+            h: try c.decodeIfPresent(Double.self, forKey: .h) ?? 160,
+            rotation: try c.decodeIfPresent(Double.self, forKey: .rotation) ?? 0,
+            color: try c.decodeIfPresent(RGBA.self, forKey: .color) ?? RGBA.ink,
+            filled: try c.decodeIfPresent(Bool.self, forKey: .filled) ?? false,
+            dotted: try c.decodeIfPresent(Bool.self, forKey: .dotted) ?? false,
+            lineWidth: try c.decodeIfPresent(Double.self, forKey: .lineWidth) ?? 6,
+            text: try c.decodeIfPresent(String.self, forKey: .text) ?? "",
+            fontSize: try c.decodeIfPresent(Double.self, forKey: .fontSize) ?? 80,
+            design: try c.decodeIfPresent(TextDesign.self, forKey: .design) ?? .rounded,
+            imageFile: try c.decodeIfPresent(String.self, forKey: .imageFile),
+            opacity: try c.decodeIfPresent(Double.self, forKey: .opacity) ?? 1,
+            flipped: try c.decodeIfPresent(Bool.self, forKey: .flipped) ?? false,
+            locked: try c.decodeIfPresent(Bool.self, forKey: .locked) ?? false
+        )
     }
 }
