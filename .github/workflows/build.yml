@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
@@ -41,3 +44,14 @@ jobs:
         with:
           name: Warqa-ipa
           path: Warqa.ipa
+
+      - name: Publish IPA to ipa branch
+        run: |
+          mkdir -p /tmp/out && cp Warqa.ipa /tmp/out/
+          cd /tmp/out
+          git init -q -b ipa
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add Warqa.ipa
+          git commit -q -m "IPA build ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" ipa
